@@ -5,7 +5,13 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "poc.db"
 
-SCHEMA = """
+# Versioned migrations, tracked via PRAGMA user_version. Index 0 = v1.
+# Rules: never edit or reorder an entry once it has run against a real db --
+# append a new one instead. Existing dbs (created pre-migrations, user_version=0)
+# pass through v1's IF NOT EXISTS harmlessly and get stamped v1.
+MIGRATIONS = [
+    # v1 -- Phase 1 baseline: generic notes + 6 structured node tables
+    """
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     raw_text TEXT NOT NULL,
@@ -69,12 +75,21 @@ CREATE TABLE IF NOT EXISTS books (
     progress TEXT,
     notes TEXT
 );
-"""
+""",
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for target, script in enumerate(MIGRATIONS[version:], start=version + 1):
+        conn.executescript(script)
+        conn.execute(f"PRAGMA user_version = {target}")
+        conn.commit()
 
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 

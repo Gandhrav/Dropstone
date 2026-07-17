@@ -5,8 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from graph import build_graph  # noqa: E402  (must load .env before ChatAnthropic is constructed)
-
+from graph import build_graph
 
 def main():
     parser = argparse.ArgumentParser(description="Capture a raw note and route it through the node graph.")
