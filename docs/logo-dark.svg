@@ -6,7 +6,7 @@
     </linearGradient>
   </defs>
 
-  <!-- icon: a drop settling, ripples become graph edges -->
+  <!-- icon: a stone settling, ripples become graph edges -->
   <g>
     <!-- connection edges -->
     <line x1="60" y1="66" x2="16" y2="90" stroke="url(#ds-grad)" stroke-width="1.6" opacity="0.55"/>
@@ -17,8 +17,16 @@
     <ellipse cx="60" cy="92" rx="30" ry="9" fill="none" stroke="url(#ds-grad)" stroke-width="3"/>
     <ellipse cx="60" cy="92" rx="47" ry="15" fill="none" stroke="url(#ds-grad)" stroke-width="2" opacity="0.4"/>
 
-    <!-- the drop -->
-    <path d="M60 8 C60 8 40 33 40 47 C40 58.5 49 68 60 68 C71 68 80 58.5 80 47 C80 33 60 8 60 8 Z" fill="url(#ds-grad)"/>
+    <!-- fall trail -->
+    <line x1="55" y1="6" x2="52" y2="16" stroke="url(#ds-grad)" stroke-width="2" opacity="0.35" stroke-linecap="round"/>
+    <line x1="65" y1="10" x2="61" y2="19" stroke="url(#ds-grad)" stroke-width="2" opacity="0.25" stroke-linecap="round"/>
+
+    <!-- the stone: faceted pebble, not a liquid drop -->
+    <path d="M60 18 L75 27 L81 46 L71 62 L49 62 L39 46 L45 27 Z"
+          fill="url(#ds-grad)" stroke="url(#ds-grad)" stroke-width="1" stroke-linejoin="round"/>
+    <!-- facet lines for a cut-stone look -->
+    <path d="M60 18 L60 40 M75 27 L60 40 M81 46 L60 40 M71 62 L60 40 M49 62 L60 40 M39 46 L60 40 M45 27 L60 40"
+          fill="none" stroke="#0f172a" stroke-width="1" opacity="0.2"/>
 
     <!-- linked nodes on the ripples -->
     <circle cx="16" cy="90" r="5" fill="url(#ds-grad)"/>
