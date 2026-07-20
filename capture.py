@@ -13,21 +13,26 @@ def main():
     args = parser.parse_args()
 
     app = build_graph()
-    result = app.invoke({"raw_text": args.text, "matches": [], "stored": []})
+    result = app.invoke({"raw_text": args.text, "matches": [], "stored": [], "linked": []})
 
     print(f"\nraw:    {args.text}")
     print(f"note_id: {result.get('note_id')}")
     if not result["matches"]:
         print("routed: (no node matched -- inbox only)")
-        return
+    else:
+        print("routed:")
+        for m in result["matches"]:
+            print(f"  - {m['node']} (confidence={m['confidence']:.2f})")
 
-    print("routed:")
-    for m in result["matches"]:
-        print(f"  - {m['node']} (confidence={m['confidence']:.2f})")
+        print("stored:")
+        for s in result.get("stored", []):
+            print(f"  - {s['node']} row #{s['row_id']}: {json.dumps(s['fields'])}")
 
-    print("stored:")
-    for s in result.get("stored", []):
-        print(f"  - {s['node']} row #{s['row_id']}: {json.dumps(s['fields'])}")
+    linked = result.get("linked", [])
+    if linked:
+        print("linked (auto, embedding similarity):")
+        for l in linked:
+            print(f"  - note #{l['note_id']} (sim={l['similarity']:.2f}): {l['raw_text']}")
 
 
 if __name__ == "__main__":

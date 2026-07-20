@@ -3,7 +3,14 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import sqlite_vec
+
 DB_PATH = Path(__file__).parent / "poc.db"
+
+# kNN auto-link threshold: cosine distance (0 = identical, 1 = unrelated).
+# bge-small puts same-topic notes around 0.2-0.35; tune after real usage.
+AUTO_LINK_MAX_DISTANCE = 0.35
+AUTO_LINK_K = 5
 
 # Versioned migrations, tracked via PRAGMA user_version. Index 0 = v1.
 # Rules: never edit or reorder an entry once it has run against a real db --
@@ -76,6 +83,30 @@ CREATE TABLE IF NOT EXISTS books (
     notes TEXT
 );
 """,
+    # v2 -- Phase 2 knowledge-graph substrate: edges + embedding metadata.
+    # The vec0 virtual table (notes_vec) is NOT created here: its dimension
+    # depends on the runtime embedding provider (local=384, voyage=1024), and
+    # migrations are static SQL. ensure_vec_table() creates it lazily and
+    # vec_meta records which model/dim the vectors belong to, so a provider
+    # switch is detected instead of silently mixing incomparable vectors.
+    """
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_note_id INTEGER NOT NULL REFERENCES notes(id),
+    target_note_id INTEGER NOT NULL REFERENCES notes(id),
+    edge_type TEXT NOT NULL DEFAULT 'related',
+    weight REAL,
+    provenance TEXT NOT NULL CHECK (provenance IN ('explicit', 'inferred')),
+    created_at TEXT NOT NULL,
+    UNIQUE (source_note_id, target_note_id, edge_type)
+);
+
+CREATE TABLE IF NOT EXISTS vec_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    model_id TEXT NOT NULL,
+    dim INTEGER NOT NULL
+);
+""",
 ]
 
 
@@ -89,8 +120,113 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
     _migrate(conn)
     return conn
+
+
+# ---------- Phase 2: embeddings + edges ----------
+
+
+def ensure_vec_table(conn: sqlite3.Connection, model_id: str, dim: int) -> None:
+    """Create the vector table for the active embedding model, or refuse if
+    the db already holds vectors from a different model (dims/values are not
+    comparable across models -- see embeddings.py docstring)."""
+    row = conn.execute("SELECT model_id, dim FROM vec_meta WHERE id = 1").fetchone()
+    if row is None:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0(embedding float[{dim}] distance_metric=cosine)"
+        )
+        conn.execute("INSERT INTO vec_meta (id, model_id, dim) VALUES (1, ?, ?)", (model_id, dim))
+        conn.commit()
+    elif row[0] != model_id or row[1] != dim:
+        raise RuntimeError(
+            f"poc.db vectors were built with {row[0]!r} (dim={row[1]}), but the active "
+            f"embedding model is {model_id!r} (dim={dim}). Re-embed all notes into a fresh "
+            "vector table before switching providers (drop notes_vec + vec_meta, run backfill.py)."
+        )
+
+
+def insert_embedding(conn: sqlite3.Connection, note_id: int, vector: list[float]) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO notes_vec (rowid, embedding) VALUES (?, ?)",
+        (note_id, sqlite_vec.serialize_float32(vector)),
+    )
+    conn.commit()
+
+
+def knn_similar(conn: sqlite3.Connection, vector: list[float], exclude_note_id: int, k: int = AUTO_LINK_K) -> list[tuple[int, float]]:
+    """Nearest existing notes by cosine distance, excluding the note itself.
+    Returns [(note_id, distance)] under AUTO_LINK_MAX_DISTANCE."""
+    rows = conn.execute(
+        "SELECT rowid, distance FROM notes_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+        (sqlite_vec.serialize_float32(vector), k + 1),
+    ).fetchall()
+    return [
+        (note_id, dist)
+        for note_id, dist in rows
+        if note_id != exclude_note_id and dist <= AUTO_LINK_MAX_DISTANCE
+    ][:k]
+
+
+def insert_edge(
+    conn: sqlite3.Connection,
+    source_note_id: int,
+    target_note_id: int,
+    provenance: str,
+    edge_type: str = "related",
+    weight: float | None = None,
+) -> None:
+    """Undirected edge, stored with source < target so A-B and B-A dedupe."""
+    a, b = sorted((source_note_id, target_note_id))
+    conn.execute(
+        "INSERT OR IGNORE INTO edges (source_note_id, target_note_id, edge_type, weight, provenance, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (a, b, edge_type, weight, provenance, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_related_notes(conn: sqlite3.Connection, note_id: int, hops: int = 1) -> list[dict]:
+    """Notes connected to note_id within N hops (recursive CTE over edges)."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE walk(note_id, depth) AS (
+            SELECT ?, 0
+            UNION
+            SELECT CASE WHEN e.source_note_id = w.note_id THEN e.target_note_id ELSE e.source_note_id END,
+                   w.depth + 1
+            FROM edges e
+            JOIN walk w ON w.note_id IN (e.source_note_id, e.target_note_id)
+            WHERE w.depth < ?
+        ),
+        nearest(note_id, depth) AS (
+            SELECT note_id, MIN(depth) FROM walk GROUP BY note_id
+        )
+        SELECT w.note_id, w.depth, n.raw_text, n.node_types,
+               e.weight, e.provenance, e.edge_type
+        FROM nearest w
+        JOIN notes n ON n.id = w.note_id
+        LEFT JOIN edges e ON (e.source_note_id = MIN(w.note_id, ?) AND e.target_note_id = MAX(w.note_id, ?))
+        WHERE w.note_id != ?
+        ORDER BY w.depth, e.weight DESC
+        """,
+        (note_id, hops, note_id, note_id, note_id),
+    ).fetchall()
+    return [
+        {
+            "note_id": r[0],
+            "depth": r[1],
+            "raw_text": r[2],
+            "node_types": json.loads(r[3]),
+            "weight": r[4],
+            "provenance": r[5],
+            "edge_type": r[6],
+        }
+        for r in rows
+    ]
 
 
 def insert_note(conn: sqlite3.Connection, raw_text: str, node_types: list[str], confidences: dict[str, float]) -> int:

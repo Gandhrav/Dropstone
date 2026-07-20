@@ -8,9 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from langchain_anthropic import ChatAnthropic  # noqa: E402  (must load .env first)
-
 from db import get_connection  # noqa: E402
+from llm import get_chat_model  # noqa: E402  (must load .env first)
 
 TABLE_FOR_NODE = {
     "expense": "expenses",
@@ -64,7 +63,7 @@ def build_report(captures: list[dict]) -> str:
         "between captures."
     )
 
-    model = ChatAnthropic(model="claude-sonnet-5")
+    model = get_chat_model()
     return model.invoke(prompt).content
 
 

@@ -1,19 +1,24 @@
 import operator
 from typing import Annotated, Optional, TypedDict
 
-from langchain_anthropic import ChatAnthropic
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from llm import get_chat_model
+
 from db import (
+    ensure_vec_table,
     get_connection,
     insert_book,
+    insert_edge,
+    insert_embedding,
     insert_expense,
     insert_idea,
     insert_note,
     insert_reminder,
     insert_research,
     insert_task,
+    knn_similar,
 )
 from schemas import RouteResult
 
@@ -65,7 +70,7 @@ NODE_CATEGORY = {
 
 CATEGORY_NODES = ["task_action", "tracker", "knowledge", "relationship"]
 
-_model = ChatAnthropic(model="claude-sonnet-5")
+_model = get_chat_model()
 _router = _model.with_structured_output(RouteResult)
 
 
@@ -75,13 +80,37 @@ class CaptureState(TypedDict):
     note_id: int
     match: Optional[dict]
     stored: Annotated[list[dict], operator.add]
+    linked: list[dict]
+
+
+_embedder = None
+
+
+def _get_embedder():
+    """Lazy singleton -- fastembed loads a ~130MB ONNX model on first use;
+    eval.py imports route_node without ever needing it."""
+    global _embedder
+    if _embedder is None:
+        from embeddings import get_embedder
+
+        _embedder = get_embedder()
+    return _embedder
 
 
 def route_node(state: CaptureState) -> dict:
-    result: RouteResult = _router.invoke(
-        [("system", SYSTEM_PROMPT), ("user", state["raw_text"])]
-    )
-    return {"matches": [m.model_dump() for m in result.matches]}
+    # Models occasionally double-encode the tool args (matches arrives as a
+    # JSON string, pydantic rejects it) -- retry once before failing. More
+    # relevant with BYOM: smaller models flake at this boundary more often.
+    last_err = None
+    for _ in range(2):
+        try:
+            result: RouteResult = _router.invoke(
+                [("system", SYSTEM_PROMPT), ("user", state["raw_text"])]
+            )
+            return {"matches": [m.model_dump() for m in result.matches]}
+        except Exception as err:  # pydantic ValidationError wrapped by langchain
+            last_err = err
+    raise last_err
 
 
 def save_note_node(state: CaptureState) -> dict:
@@ -91,6 +120,30 @@ def save_note_node(state: CaptureState) -> dict:
     note_id = insert_note(conn, state["raw_text"], node_types, confidences)
     conn.close()
     return {"note_id": note_id}
+
+
+def auto_link_node(state: CaptureState) -> dict:
+    """Phase 2: embed the note, store the vector, kNN-link to similar past
+    notes. Edges carry provenance='inferred' (embedding similarity) as opposed
+    to 'explicit' (router/structural knowledge)."""
+    embedder = _get_embedder()
+    vector = embedder.embed([state["raw_text"]])[0]
+
+    conn = get_connection()
+    ensure_vec_table(conn, embedder.model_id, embedder.dim)
+
+    neighbors = knn_similar(conn, vector, exclude_note_id=state["note_id"])
+    insert_embedding(conn, state["note_id"], vector)
+
+    linked = []
+    for other_id, distance in neighbors:
+        similarity = round(1.0 - distance, 3)
+        insert_edge(conn, state["note_id"], other_id, provenance="inferred", weight=similarity)
+        raw = conn.execute("SELECT raw_text FROM notes WHERE id = ?", (other_id,)).fetchone()
+        linked.append({"note_id": other_id, "similarity": similarity, "raw_text": raw[0] if raw else "?"})
+    conn.close()
+
+    return {"linked": linked}
 
 
 def dispatch_to_nodes(state: CaptureState):
@@ -121,13 +174,15 @@ def build_graph():
     builder = StateGraph(CaptureState)
     builder.add_node("route", route_node)
     builder.add_node("save_note", save_note_node)
+    builder.add_node("auto_link", auto_link_node)
     for category in CATEGORY_NODES:
         builder.add_node(category, category_store_node)
         builder.add_edge(category, END)
 
     builder.add_edge(START, "route")
     builder.add_edge("route", "save_note")
-    builder.add_conditional_edges("save_note", dispatch_to_nodes)
+    builder.add_edge("save_note", "auto_link")
+    builder.add_conditional_edges("auto_link", dispatch_to_nodes)
 
     return builder.compile()
 
